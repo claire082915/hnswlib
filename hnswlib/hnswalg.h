@@ -2,6 +2,8 @@
 
 #include "visited_list_pool.h"
 #include "hnswlib.h"
+#include "hnsw_profiler.h"
+#include "shard_label.h"
 #include <atomic>
 #include <random>
 #include <stdlib.h>
@@ -9,6 +11,7 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -56,8 +59,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     DISTFUNC<dist_t> fstdistfunc_;
     void *dist_func_param_{nullptr};
 
-    mutable std::mutex label_lookup_lock;  // lock for label_lookup_
-    std::unordered_map<labeltype, tableint> label_lookup_;
+    ShardedLabelLookup label_lookup_;
+    // mutable std::mutex label_lookup_lock;  // lock for label_lookup_
+    // std::unordered_map<labeltype, tableint> label_lookup_;
 
     std::default_random_engine level_generator_;
     std::default_random_engine update_probability_generator_;
@@ -314,6 +318,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_t ef,
         BaseFilterFunctor* isIdAllowed = nullptr,
         BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+
+        HNSWLightProfiler::Timer total_timer("searchBaseLayerST_total");
+
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
@@ -339,6 +346,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         visited_array[ep_id] = visited_array_tag;
 
+        { HNSWLightProfiler::Timer neighbor_expand_timer("searchBaseLayerST_neighbor_expansion");
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
@@ -384,9 +392,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 #endif
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
-
                     char *currObj1 = (getDataByInternalId(candidate_id));
-                    dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                    dist_t dist;
+                    { HNSWLightProfiler::Timer dist_timer("searchBaseLayerST_distance_computation");
+                    
+                        dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                    }
 
                     bool flag_consider_candidate;
                     if (!bare_bone_search && stop_condition) {
@@ -434,6 +445,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
         }
+    }
 
         visited_list_pool_->releaseVisitedList(vl);
         return top_candidates;
@@ -509,6 +521,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
         int level,
         bool isUpdate) {
+
+        // HNSWLightProfiler::Timer total_timer("mutuallyConnectNewElement_total");
+
         size_t Mcurmax = level ? maxM_ : maxM0_;
         getNeighborsByHeuristic2(top_candidates, M_);
         if (top_candidates.size() > M_)
@@ -526,6 +541,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             // lock only during the update
             // because during the addition the lock for cur_c is already acquired
+            HNSWLightProfiler::Timer lock_curc_timer("mutuallyConnectNewElement_lock_cur_c");
             std::unique_lock <std::mutex> lock(link_list_locks_[cur_c], std::defer_lock);
             if (isUpdate) {
                 lock.lock();
@@ -550,10 +566,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 data[idx] = selectedNeighbors[idx];
             }
         }
-
+        {
+            // HNSWLightProfiler::Timer neighbor_loop_timer("mutuallyConnectNewElement_neighbor_loop");
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
+            // HNSWLightProfiler::Timer lock_acquire_timer("full_neighbor_operation");
             std::unique_lock <std::mutex> lock(link_list_locks_[selectedNeighbors[idx]]);
 
+            {
+                // HNSWLightProfiler::Timer actual_work_timer("actual_neighbor_processing");
             linklistsizeint *ll_other;
             if (level == 0)
                 ll_other = get_linklist0(selectedNeighbors[idx]);
@@ -587,6 +607,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     data[sz_link_list_other] = cur_c;
                     setListCount(ll_other, sz_link_list_other + 1);
                 } else {
+                    HNSWLightProfiler::Timer heuristic_timer("mutuallyConnectNewElement_rebuild");
                     // finding the "weakest" element to replace it with the new one
                     dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(selectedNeighbors[idx]),
                                                 dist_func_param_);
@@ -599,9 +620,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                 fstdistfunc_(getDataByInternalId(data[j]), getDataByInternalId(selectedNeighbors[idx]),
                                                 dist_func_param_), data[j]);
                     }
-
+                    {
+                    HNSWLightProfiler::Timer neighbors("mutuallyConnectNewElement_getNeighbors");
                     getNeighborsByHeuristic2(candidates, Mcurmax);
-
+                    }
                     int indx = 0;
                     while (candidates.size() > 0) {
                         data[indx] = candidates.top().second;
@@ -624,8 +646,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     } */
                 }
             }
+        }}
         }
-
         return next_closest_entry_point;
     }
 
@@ -827,13 +849,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
         
-        std::unique_lock <std::mutex> lock_table(label_lookup_lock);
-        auto search = label_lookup_.find(label);
-        if (search == label_lookup_.end() || isMarkedDeleted(search->second)) {
+
+        tableint internalId = label_lookup_.find(label);  // Thread-safe lookup
+        if (internalId == -1 || isMarkedDeleted(internalId)) {
             throw std::runtime_error("Label not found");
         }
-        tableint internalId = search->second;
-        lock_table.unlock();
+        // std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+        // auto search = label_lookup_.find(label);
+        // if (search == label_lookup_.end() || isMarkedDeleted(search->second)) {
+        //     throw std::runtime_error("Label not found");
+        // }
+        // tableint internalId = search->second;
+        // lock_table.unlock();
 
         char* data_ptrv = getDataByInternalId(internalId);
         size_t dim = *((size_t *) dist_func_param_);
@@ -854,13 +881,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
 
-        std::unique_lock <std::mutex> lock_table(label_lookup_lock);
-        auto search = label_lookup_.find(label);
-        if (search == label_lookup_.end()) {
+        tableint internalId = label_lookup_.find(label);  // Thread-safe lookup
+        if (internalId == -1 || isMarkedDeleted(internalId)) {
             throw std::runtime_error("Label not found");
         }
-        tableint internalId = search->second;
-        lock_table.unlock();
+        // std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+        // auto search = label_lookup_.find(label);
+        // if (search == label_lookup_.end()) {
+        //     throw std::runtime_error("Label not found");
+        // }
+        // tableint internalId = search->second;
+        // lock_table.unlock();
 
         markDeletedInternal(internalId);
     }
@@ -896,13 +927,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
 
-        std::unique_lock <std::mutex> lock_table(label_lookup_lock);
-        auto search = label_lookup_.find(label);
-        if (search == label_lookup_.end()) {
+        tableint internalId = label_lookup_.find(label);  // Thread-safe lookup
+        if (internalId == -1 || isMarkedDeleted(internalId)) {
             throw std::runtime_error("Label not found");
         }
-        tableint internalId = search->second;
-        lock_table.unlock();
+        // std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+        // auto search = label_lookup_.find(label);
+        // if (search == label_lookup_.end()) {
+        //     throw std::runtime_error("Label not found");
+        // }
+        // tableint internalId = search->second;
+        // lock_table.unlock();
 
         unmarkDeletedInternal(internalId);
     }
@@ -952,6 +987,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     * If replacement of deleted elements is enabled: replaces previously deleted point if any, updating it with new point
     */
     void addPoint(const void *data_point, labeltype label, bool replace_deleted = false) {
+        // HNSWLightProfiler::Timer t("addPoint:total");
         if ((allow_replace_deleted_ == false) && (replace_deleted == true)) {
             throw std::runtime_error("Replacement of deleted elements is disabled in constructor");
         }
@@ -981,10 +1017,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             labeltype label_replaced = getExternalLabel(internal_id_replaced);
             setExternalLabel(internal_id_replaced, label);
 
-            std::unique_lock <std::mutex> lock_table(label_lookup_lock);
-            label_lookup_.erase(label_replaced);
-            label_lookup_[label] = internal_id_replaced;
-            lock_table.unlock();
+            // Replace global lock + map operations with sharded version:
+            label_lookup_.erase(label_replaced);  // Thread-safe erase
+            label_lookup_.insert(label, internal_id_replaced);  // Thread-safe insert
+            // std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+            // label_lookup_.erase(label_replaced);
+            // label_lookup_[label] = internal_id_replaced;
+            // lock_table.unlock();
 
             unmarkDeletedInternal(internal_id_replaced);
             updatePoint(data_point, internal_id_replaced, 1.0);
@@ -1151,20 +1190,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     tableint addPoint(const void *data_point, labeltype label, int level) {
+        // hnswlib::HNSWLightProfiler::Timer total_timer("addPoint:internal_total");
         tableint cur_c = 0;
         {
             // Checking if the element with the same label already exists
             // if so, updating it *instead* of creating a new element.
-            std::unique_lock <std::mutex> lock_table(label_lookup_lock);
-            auto search = label_lookup_.find(label);
-            if (search != label_lookup_.end()) {
-                tableint existingInternalId = search->second;
+            HNSWLightProfiler::Timer t("addPoint:label_lookup");
+            tableint existingInternalId = label_lookup_.find(label);
+    
+            if (existingInternalId != -1) {  // Label exists
                 if (allow_replace_deleted_) {
                     if (isMarkedDeleted(existingInternalId)) {
                         throw std::runtime_error("Can't use addPoint to update deleted elements if replacement of deleted elements is enabled.");
                     }
                 }
-                lock_table.unlock();
 
                 if (isMarkedDeleted(existingInternalId)) {
                     unmarkDeletedInternal(existingInternalId);
@@ -1173,6 +1212,24 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 return existingInternalId;
             }
+            // std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+            // auto search = label_lookup_.find(label);
+            // if (search != label_lookup_.end()) {
+            //     tableint existingInternalId = search->second;
+            //     if (allow_replace_deleted_) {
+            //         if (isMarkedDeleted(existingInternalId)) {
+            //             throw std::runtime_error("Can't use addPoint to update deleted elements if replacement of deleted elements is enabled.");
+            //         }
+            //     }
+            //     lock_table.unlock();
+
+            //     if (isMarkedDeleted(existingInternalId)) {
+            //         unmarkDeletedInternal(existingInternalId);
+            //     }
+            //     updatePoint(data_point, existingInternalId, 1.0);
+
+            //     return existingInternalId;
+            // }
 
             if (cur_element_count >= max_elements_) {
                 throw std::runtime_error("The number of elements exceeds the specified limit");
@@ -1180,30 +1237,39 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             cur_c = cur_element_count;
             cur_element_count++;
-            label_lookup_[label] = cur_c;
+            label_lookup_.insert(label, cur_c);
+            // label_lookup_[label] = cur_c;
         }
-
+        int curlevel;
+        {
+        HNSWLightProfiler::Timer t("addPoint:linklist_lock_and_level_assign");
         std::unique_lock <std::mutex> lock_el(link_list_locks_[cur_c]);
         int curlevel = getRandomLevel(mult_);
         if (level > 0)
             curlevel = level;
 
         element_levels_[cur_c] = curlevel;
-
+        }
+        int maxlevelcopy;
+        {
+        HNSWLightProfiler::Timer t("addPoint:global_lock_copy");
         std::unique_lock <std::mutex> templock(global);
         int maxlevelcopy = maxlevel_;
         if (curlevel <= maxlevelcopy)
             templock.unlock();
+        }
         tableint currObj = enterpoint_node_;
         tableint enterpoint_copy = enterpoint_node_;
-
+        {
+        HNSWLightProfiler::Timer t("addPoint:data_initialization");
         memset(data_level0_memory_ + cur_c * size_data_per_element_ + offsetLevel0_, 0, size_data_per_element_);
 
         // Initialisation of the data and label
         memcpy(getExternalLabeLp(cur_c), &label, sizeof(labeltype));
         memcpy(getDataByInternalId(cur_c), data_point, data_size_);
-
+        }
         if (curlevel) {
+            // HNSWLightProfiler::Timer t("addPoint:allocate_linklist");
             linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel + 1);
             if (linkLists_[cur_c] == nullptr)
                 throw std::runtime_error("Not enough memory: addPoint failed to allocate linklist");
@@ -1212,16 +1278,30 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         if ((signed)currObj != -1) {
             if (curlevel < maxlevelcopy) {
-                dist_t curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), dist_func_param_);
+                HNSWLightProfiler::Timer t("addPoint:entry_navigation");
+
+                dist_t curdist;
+                {
+                    HNSWLightProfiler::Timer distance_timer("addPoint:distance_computation");
+                    curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), dist_func_param_);
+                }
                 for (int level = maxlevelcopy; level > curlevel; level--) {
                     bool changed = true;
                     while (changed) {
                         changed = false;
                         unsigned int *data;
+                        {
+                        HNSWLightProfiler::Timer lock_timer("addPoint:link_list_lock");
                         std::unique_lock <std::mutex> lock(link_list_locks_[currObj]);
+                        }
+                        int size;
+                        {
+                        HNSWLightProfiler::Timer list_timer("addPoint:get_linklist");
                         data = get_linklist(currObj, level);
-                        int size = getListCount(data);
+                        size = getListCount(data);
+                        }
 
+                        { HNSWLightProfiler::Timer traversal("addPoint:graph_traversal");
                         tableint *datal = (tableint *) (data + 1);
                         for (int i = 0; i < size; i++) {
                             tableint cand = datal[i];
@@ -1234,6 +1314,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                                 changed = true;
                             }
                         }
+                        }
+
                     }
                 }
             }
@@ -1250,7 +1332,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     if (top_candidates.size() > ef_construction_)
                         top_candidates.pop();
                 }
+                {
+                // HNSWLightProfiler::Timer t("addPoint:mutually_connect_new_element");
                 currObj = mutuallyConnectNewElement(data_point, cur_c, top_candidates, level, false);
+                }
             }
         } else {
             // Do nothing for the first element
@@ -1260,6 +1345,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         // Releasing lock for the maximum level
         if (curlevel > maxlevelcopy) {
+            // HNSWLightProfiler::Timer t("addPoint:update_entry_point");
             enterpoint_node_ = cur_c;
             maxlevel_ = curlevel;
         }
@@ -1269,12 +1355,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        HNSWLightProfiler::Timer total_timer("searchKnn_total");
+
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
 
+        {
+            HNSWLightProfiler::Timer descent_timer("searchKnn_layer_descent");
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
             while (changed) {
@@ -1287,6 +1377,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 metric_distance_computations+=size;
 
                 tableint *datal = (tableint *) (data + 1);
+                {
+                HNSWLightProfiler::Timer neighbor_expansion_timer("searchKnn_neighbor_expansion_level_" + std::to_string(level));
                 for (int i = 0; i < size; i++) {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
@@ -1299,19 +1391,24 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         changed = true;
                     }
                 }
+                }
             }
+        }
         }
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
+        {
+        HNSWLightProfiler::Timer base_layer_timer("searchKnn_baseLayerSearch");
         if (bare_bone_search) {
-            top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+            top_candidates = searchBaseLayerST<true>(currObj, query_data, std::max(ef_, k), isIdAllowed);
         } else {
-            top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+            top_candidates = searchBaseLayerST<false>(currObj, query_data, std::max(ef_, k), isIdAllowed);
+        }
         }
 
+        {
+        HNSWLightProfiler::Timer postprocess_timer("searchKnn_result_postprocessing");
         while (top_candidates.size() > k) {
             top_candidates.pop();
         }
@@ -1320,9 +1417,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             result.push(std::pair<dist_t, labeltype>(rez.first, getExternalLabel(rez.second)));
             top_candidates.pop();
         }
+        }
+
         return result;
     }
 
+    
 
     std::vector<std::pair<dist_t, labeltype >>
     searchStopConditionClosest(
