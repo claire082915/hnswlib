@@ -973,6 +973,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     unsigned short int getListCount(linklistsizeint * ptr) const {
+        if (ptr == nullptr) {
+            return 0;  // or throw std::invalid_argument("null pointer");
+        }
         return *((unsigned short int *)ptr);
     }
 
@@ -1290,15 +1293,60 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     while (changed) {
                         changed = false;
                         unsigned int *data;
+                        int size;
                         {
                         HNSWLightProfiler::Timer lock_timer("addPoint:link_list_lock");
                         std::unique_lock <std::mutex> lock(link_list_locks_[currObj]);
+                        // }
+                        
+                        // {
+                        // HNSWLightProfiler::Timer list_timer("addPoint:get_linklist");
+
+                        std::cout << "=== DEBUG INFO ===" << std::endl;
+                        std::cout << "currObj: " << currObj << std::endl;
+                        std::cout << "level: " << level << std::endl;
+                        std::cout << "maxlevelcopy: " << maxlevelcopy << std::endl;
+                        std::cout << "curlevel: " << curlevel << std::endl;
+                        std::cout << "max_elements_: " << max_elements_ << std::endl;
+                        
+                        // Check if currObj is valid
+                        if (currObj < 0 || currObj >= max_elements_) {
+                            std::cerr << "ERROR: Invalid currObj=" << currObj << std::endl;
+                            throw std::runtime_error("Invalid currObj");
                         }
-                        int size;
-                        {
-                        HNSWLightProfiler::Timer list_timer("addPoint:get_linklist");
+
+                        // Check if level is reasonable
+                        if (level < 0 || level > 16) {  // Assuming max reasonable level is 16
+                            std::cerr << "ERROR: Invalid level=" << level << std::endl;
+                            throw std::runtime_error("Invalid level");
+                        }
+
+                        // Check if linkLists_[currObj] exists and is valid
+                        if (linkLists_[currObj] == nullptr) {
+                            std::cerr << "ERROR: linkLists_[" << currObj << "] is nullptr" << std::endl;
+                            throw std::runtime_error("linkLists is nullptr");
+                        }
+
+                        std::cout << "linkLists_[" << currObj << "] = " << (void*)linkLists_[currObj] << std::endl;
+
                         data = get_linklist(currObj, level);
-                        size = getListCount(data);
+
+                        std::cout << "get_linklist returned: " << (void*)data << std::endl;
+
+                        if (data == nullptr) {
+                            std::cerr << "ERROR: get_linklist returned nullptr for currObj=" 
+                                      << currObj << ", level=" << level << std::endl;
+                            throw std::runtime_error("get_linklist returned nullptr");
+                        }
+                        try {
+                            size = getListCount(data);
+                            std::cout << "getListCount returned: " << size << std::endl;
+                        } catch (...) {
+                            std::cerr << "ERROR: getListCount failed for data pointer=" << data 
+                                      << ", currObj=" << currObj << ", level=" << level << std::endl;
+                            throw;
+                        }
+                        // size = getListCount(data);
                         }
 
                         { HNSWLightProfiler::Timer traversal("addPoint:graph_traversal");
